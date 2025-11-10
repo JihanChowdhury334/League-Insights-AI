@@ -359,7 +359,7 @@ function PatternCard({ label, value, color }: {
 function KillHeatmap({ killPositions }: { killPositions: Array<{ x: number; y: number }> }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [showRaw, setShowRaw] = useState(false);
-  const intensity = 30; // Fixed intensity value
+  const intensity = 20; // Fixed intensity value
 
   useEffect(() => {
     if (!canvasRef.current || killPositions.length === 0) return;
