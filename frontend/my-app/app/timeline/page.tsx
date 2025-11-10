@@ -358,8 +358,8 @@ function PatternCard({ label, value, color }: {
 // Kill Heatmap Component
 function KillHeatmap({ killPositions }: { killPositions: Array<{ x: number; y: number }> }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [intensity, setIntensity] = useState(50);
   const [showRaw, setShowRaw] = useState(false);
+  const intensity = 50; // Fixed intensity value
 
   useEffect(() => {
     if (!canvasRef.current || killPositions.length === 0) return;
@@ -408,30 +408,18 @@ function KillHeatmap({ killPositions }: { killPositions: Array<{ x: number; y: n
 
       ctx.globalCompositeOperation = "source-over";
     };
-  }, [killPositions, intensity, showRaw]);
+  }, [killPositions, showRaw]);
 
   return (
     <div className="space-y-4">
       {/* Controls */}
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex items-center gap-2 flex-1">
-          <span className="text-sm text-slate-400">Intensity:</span>
-          <input
-            type="range"
-            min="10"
-            max="100"
-            value={intensity}
-            onChange={(e) => setIntensity(Number(e.target.value))}
-            className="flex-1"
-          />
-          <span className="text-sm text-slate-300 w-12">{intensity}</span>
-        </div>
+      <div className="flex items-center justify-center gap-4">
         <Button
           variant={showRaw ? "default" : "outline"}
           size="sm"
           onClick={() => setShowRaw(!showRaw)}
         >
-          {showRaw ? "Heatmap" : "Raw Points"}
+          {showRaw ? "Show Heatmap" : "Show Raw Points"}
         </Button>
       </div>
 
