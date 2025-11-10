@@ -9,7 +9,7 @@ import {
   ProcessTimelinesResponse,
 } from "./types";
 
-const BASE_URL = "https://league-insights-ai-production.up.railway.app/";
+const BASE_URL = "https://league-insights-ai.up.railway.app/";
 
 // ============================================
 // Helper: Fetch with error handling
