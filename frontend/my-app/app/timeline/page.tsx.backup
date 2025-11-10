@@ -1,0 +1,461 @@
+"use client";
+
+import { useEffect, useState, useRef } from "react";
+import { useRouter } from "next/navigation";
+import { Navigation } from "@/components/navigation";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { GetTimelineStatsResponse } from "@/lib/types";
+import { 
+  Target, TrendingUp, TrendingDown, Clock, 
+  Zap, Shield, Award, MapPin
+} from "lucide-react";
+import {
+  RadarChart, Radar, PolarGrid, PolarAngleAxis, PolarRadiusAxis,
+  PieChart, Pie, Cell, ResponsiveContainer, Tooltip
+} from "recharts";
+
+const COLORS = {
+  primary: "#f59e0b",
+  secondary: "#3b82f6",
+  success: "#10b981",
+  danger: "#ef4444",
+  purple: "#a855f7",
+  cyan: "#06b6d4",
+};
+
+export default function TimelinePage() {
+  const router = useRouter();
+  const [timeline, setTimeline] = useState<GetTimelineStatsResponse | null>(null);
+
+  useEffect(() => {
+    const data = sessionStorage.getItem("timelineData");
+    if (!data) {
+      router.push("/");
+      return;
+    }
+    setTimeline(JSON.parse(data));
+  }, [router]);
+
+  if (!timeline) {
+    return (
+      <>
+        <Navigation />
+        <div className="container mx-auto px-4 py-20 text-center">
+          <p className="text-slate-400">Loading timeline...</p>
+        </div>
+      </>
+    );
+  }
+
+  const identityData = [
+    { subject: "Early Game", value: timeline.identity_style.early_game_score, fullMark: 100 },
+    { subject: "Roaming", value: timeline.identity_style.roaming_score, fullMark: 100 },
+    { subject: "Consistency", value: timeline.identity_style.consistency_score, fullMark: 100 },
+    { subject: "Risk", value: timeline.identity_style.risk_score, fullMark: 100 },
+  ];
+
+  const objectiveData = [
+    { name: "Dragon", value: timeline.objective_participation.dragon },
+    { name: "Baron", value: timeline.objective_participation.baron },
+    { name: "Herald", value: timeline.objective_participation.herald },
+    { name: "Tower", value: timeline.objective_participation.tower },
+    { name: "Inhibitor", value: timeline.objective_participation.inhibitor },
+  ];
+
+  return (
+    <>
+      <Navigation />
+      
+      <main className="container mx-auto px-4 py-8 space-y-8">
+        {/* Header */}
+        <div className="text-center space-y-2">
+          <h1 className="text-4xl font-bold text-purple-400">
+            Timeline Analytics
+          </h1>
+          <p className="text-slate-400">
+            {timeline.gameName}#{timeline.tagLine}
+          </p>
+        </div>
+
+        {/* Identity & Style */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* Radar Chart */}
+          <Card className="bg-slate-900/50 border-slate-800">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Target className="h-5 w-5 text-purple-400" />
+                Identity & Playstyle
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <ResponsiveContainer width="100%" height={300}>
+                <RadarChart data={identityData}>
+                  <PolarGrid stroke="#334155" />
+                  <PolarAngleAxis dataKey="subject" stroke="#94a3b8" />
+                  <PolarRadiusAxis angle={90} domain={[0, 100]} stroke="#94a3b8" />
+                  <Radar 
+                    name="Score" 
+                    dataKey="value" 
+                    stroke={COLORS.purple} 
+                    fill={COLORS.purple} 
+                    fillOpacity={0.6} 
+                  />
+                  <Tooltip 
+                    contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #334155' }}
+                  />
+                </RadarChart>
+              </ResponsiveContainer>
+            </CardContent>
+          </Card>
+
+          {/* Style Breakdown */}
+          <Card className="bg-slate-900/50 border-slate-800">
+            <CardHeader>
+              <CardTitle>Style Breakdown</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <StyleBar 
+                label="Early Game" 
+                value={timeline.identity_style.early_game_score}
+                icon={<Zap className="h-4 w-4" />}
+                color="bg-yellow-500"
+              />
+              <StyleBar 
+                label="Roaming" 
+                value={timeline.identity_style.roaming_score}
+                icon={<MapPin className="h-4 w-4" />}
+                color="bg-blue-500"
+              />
+              <StyleBar 
+                label="Consistency" 
+                value={timeline.identity_style.consistency_score}
+                icon={<Shield className="h-4 w-4" />}
+                color="bg-green-500"
+              />
+              <StyleBar 
+                label="Risk" 
+                value={timeline.identity_style.risk_score}
+                icon={<TrendingUp className="h-4 w-4" />}
+                color="bg-red-500"
+              />
+            </CardContent>
+          </Card>
+        </div>
+
+        {/* Trends */}
+        <Card className="bg-slate-900/50 border-slate-800">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <TrendingUp className="h-5 w-5 text-green-400" />
+              Game Trends
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+              <TrendCard
+                title="Biggest Spike"
+                moment={timeline.trends.biggest_spike}
+                isPositive
+              />
+              <TrendCard
+                title="Biggest Throw"
+                moment={timeline.trends.biggest_throw}
+                isPositive={false}
+              />
+              <div className="p-4 bg-slate-800/50 rounded-lg space-y-2">
+                <h4 className="font-semibold text-slate-300">Early Dominance</h4>
+                <p className="text-3xl font-bold text-yellow-400">
+                  {timeline.trends.early_dominance.toFixed(1)}%
+                </p>
+              </div>
+              <div className="p-4 bg-slate-800/50 rounded-lg space-y-2">
+                <h4 className="font-semibold text-slate-300">Midgame Swing</h4>
+                <p className="text-3xl font-bold text-purple-400">
+                  {timeline.trends.midgame_swing.toFixed(1)}%
+                </p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Level Timings */}
+        <Card className="bg-slate-900/50 border-slate-800">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Clock className="h-5 w-5 text-blue-400" />
+              Level Timings
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-3 gap-4">
+              <div className="text-center p-4 bg-slate-800/50 rounded-lg">
+                <p className="text-sm text-slate-400 mb-2">Level 6</p>
+                <p className="text-3xl font-bold text-blue-400">
+                  {timeline.level_timings.avg_level_6.toFixed(1)}m
+                </p>
+              </div>
+              <div className="text-center p-4 bg-slate-800/50 rounded-lg">
+                <p className="text-sm text-slate-400 mb-2">Level 11</p>
+                <p className="text-3xl font-bold text-purple-400">
+                  {timeline.level_timings.avg_level_11.toFixed(1)}m
+                </p>
+              </div>
+              <div className="text-center p-4 bg-slate-800/50 rounded-lg">
+                <p className="text-sm text-slate-400 mb-2">Level 16</p>
+                <p className="text-3xl font-bold text-pink-400">
+                  {timeline.level_timings.avg_level_16.toFixed(1)}m
+                </p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Comeback Pattern */}
+        <Card className="bg-slate-900/50 border-slate-800">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Award className="h-5 w-5 text-green-400" />
+              Comeback Patterns
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+              <PatternCard
+                label="Comeback Wins"
+                value={timeline.comeback_pattern.comeback_wins}
+                color="text-green-400"
+              />
+              <PatternCard
+                label="Dominant Wins"
+                value={timeline.comeback_pattern.dominant_wins}
+                color="text-blue-400"
+              />
+              <PatternCard
+                label="Neutral Games"
+                value={timeline.comeback_pattern.neutral_games}
+                color="text-slate-400"
+              />
+              <PatternCard
+                label="Fell Behind"
+                value={timeline.comeback_pattern.fell_behind_losses}
+                color="text-orange-400"
+              />
+              <PatternCard
+                label="Throws"
+                value={timeline.comeback_pattern.throws}
+                color="text-red-400"
+              />
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Objective Participation */}
+        <Card className="bg-slate-900/50 border-slate-800">
+          <CardHeader>
+            <CardTitle>Objective Participation</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <ResponsiveContainer width="100%" height={300}>
+              <PieChart>
+                <Pie
+                  data={objectiveData}
+                  cx="50%"
+                  cy="50%"
+                  labelLine={false}
+                  label={({ name, percent }) => `${name} ${percent ? (percent * 100).toFixed(0) : 0}%`}
+                  outerRadius={100}
+                  fill="#8884d8"
+                  dataKey="value"
+                >
+                  {objectiveData.map((_, index) => (
+                    <Cell key={`cell-${index}`} fill={Object.values(COLORS)[index % Object.values(COLORS).length]} />
+                  ))}
+                </Pie>
+                <Tooltip 
+                  contentStyle={{ backgroundColor: '#1e293b', border: '1px solid #334155' }}
+                />
+              </PieChart>
+            </ResponsiveContainer>
+          </CardContent>
+        </Card>
+
+        {/* Heatmap */}
+        <Card className="bg-slate-900/50 border-slate-800">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <MapPin className="h-5 w-5 text-red-400" />
+              Kill Heatmap
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <KillHeatmap killPositions={timeline.kill_positions} />
+          </CardContent>
+        </Card>
+      </main>
+    </>
+  );
+}
+
+// Helper Components
+function StyleBar({ label, value, icon, color }: {
+  label: string;
+  value: number;
+  icon: React.ReactNode;
+  color: string;
+}) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          {icon}
+          <span className="text-sm text-slate-300">{label}</span>
+        </div>
+        <span className="text-sm font-semibold text-slate-200">{value.toFixed(0)}</span>
+      </div>
+      <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
+        <div 
+          className={`h-full ${color} transition-all`}
+          style={{ width: `${value}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function TrendCard({ title, moment, isPositive }: {
+  title: string;
+  moment: any;
+  isPositive: boolean;
+}) {
+  const Icon = isPositive ? TrendingUp : TrendingDown;
+  const color = isPositive ? "text-green-400" : "text-red-400";
+
+  return (
+    <div className="p-4 bg-slate-800/50 rounded-lg space-y-2">
+      <h4 className="font-semibold text-slate-300 flex items-center gap-2">
+        <Icon className={`h-4 w-4 ${color}`} />
+        {title}
+      </h4>
+      <p className="text-lg font-bold text-yellow-400">{moment.champion}</p>
+      <div className="space-y-1 text-sm text-slate-400">
+        <p>Minute {moment.minute}</p>
+        <p className={color}>
+          {moment.gold_diff > 0 ? '+' : ''}{moment.gold_diff.toFixed(0)}g
+        </p>
+        <Badge variant={moment.result === "Win" ? "default" : "destructive"} className="mt-2">
+          {moment.result}
+        </Badge>
+      </div>
+    </div>
+  );
+}
+
+function PatternCard({ label, value, color }: {
+  label: string;
+  value: number;
+  color: string;
+}) {
+  return (
+    <div className="text-center p-4 bg-slate-800/50 rounded-lg">
+      <p className={`text-3xl font-bold ${color}`}>{value}</p>
+      <p className="text-sm text-slate-400 mt-2">{label}</p>
+    </div>
+  );
+}
+
+// Kill Heatmap Component
+function KillHeatmap({ killPositions }: { killPositions: any[] }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [intensity, setIntensity] = useState(50);
+  const [showRaw, setShowRaw] = useState(false);
+
+  useEffect(() => {
+    if (!canvasRef.current || killPositions.length === 0) return;
+
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    // Load Rift map image
+    const img = new Image();
+    img.src = "/riftmap.jpeg";
+    
+    img.onload = () => {
+      // Clear and draw background
+      canvas.width = 800;
+      canvas.height = 800;
+      ctx.drawImage(img, 0, 0, 800, 800);
+
+      // Draw kill points
+      ctx.globalCompositeOperation = "lighter";
+
+      killPositions.forEach((kill) => {
+        // Transform Riot coordinates to canvas
+        const x = (kill.x / 15000) * 800;
+        const y = 800 - (kill.y / 15000) * 800;
+
+        if (showRaw) {
+          // Raw points mode
+          ctx.fillStyle = "rgba(255, 0, 0, 0.6)";
+          ctx.beginPath();
+          ctx.arc(x, y, 3, 0, Math.PI * 2);
+          ctx.fill();
+        } else {
+          // Heatmap mode with gaussian blur
+          const gradient = ctx.createRadialGradient(x, y, 0, x, y, intensity);
+          gradient.addColorStop(0, `rgba(255, 0, 0, ${0.8 * (intensity / 100)})`);
+          gradient.addColorStop(0.5, `rgba(255, 100, 0, ${0.4 * (intensity / 100)})`);
+          gradient.addColorStop(1, "rgba(255, 200, 0, 0)");
+
+          ctx.fillStyle = gradient;
+          ctx.beginPath();
+          ctx.arc(x, y, intensity, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      });
+
+      ctx.globalCompositeOperation = "source-over";
+    };
+  }, [killPositions, intensity, showRaw]);
+
+  return (
+    <div className="space-y-4">
+      {/* Controls */}
+      <div className="flex items-center justify-between gap-4">
+        <div className="flex items-center gap-2 flex-1">
+          <span className="text-sm text-slate-400">Intensity:</span>
+          <input
+            type="range"
+            min="10"
+            max="100"
+            value={intensity}
+            onChange={(e) => setIntensity(Number(e.target.value))}
+            className="flex-1"
+          />
+          <span className="text-sm text-slate-300 w-12">{intensity}</span>
+        </div>
+        <Button
+          variant={showRaw ? "default" : "outline"}
+          size="sm"
+          onClick={() => setShowRaw(!showRaw)}
+        >
+          {showRaw ? "Heatmap" : "Raw Points"}
+        </Button>
+      </div>
+
+      {/* Canvas */}
+      <div className="relative w-full aspect-square bg-slate-950 rounded-lg overflow-hidden">
+        <canvas
+          ref={canvasRef}
+          className="w-full h-full"
+        />
+      </div>
+
+      <p className="text-sm text-slate-400 text-center">
+        {killPositions.length} kill positions tracked
+      </p>
+    </div>
+  );
+}
