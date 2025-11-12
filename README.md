@@ -9,6 +9,17 @@ League Insights AI is a full-stack web application that analyzes your League of 
 [![Frontend](https://img.shields.io/badge/frontend-Next.js-black)](https://github.com/JihanChowdhury334/League-Insights-AI)
 
 ---
+## 🖼️ Gallery
+
+Explore League Insights AI in action — from data-driven stats to AI-powered recaps.
+
+| Stats Overview | Extreme Games | Timeline |
+|:---:|:---:|:---:|
+| ![Stats](./gallery1.jpg) | ![Extreme Games](./gallery2.jpg) | ![Timeline](./gallery3.jpg) |
+
+| Playstyle & Identity | Kill Heatmap | AI Recap |
+|:---:|:---:|:---:|
+| ![Playstyle](./gallery4.jpg) | ![Heatmap](./gallery5.jpg) | ![AI Recap](./gallery6.jpg) |
 
 ## ✨ Features
 
