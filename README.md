@@ -13,6 +13,30 @@ To ensure fast loading during demos, judging, and public testing, this app uses 
 
 Searching any other Riot IDs will trigger **full year-long match-history aggregation**, which may result in **significantly longer loading times** depending on the number of games played.
 
+## 🌍 Region Support
+
+League Insights AI **supports all Riot regions**, including:
+
+- **NA**
+- **EUW**
+- **EUNE**
+- **KR**
+- **BR**
+- **LAN**
+- **LAS**
+- **OCE**
+- **JP**
+- **TR**
+- **RU**
+- **PH2**
+- **SG2**
+- **TH2**
+- **TW2**
+- **VN2**
+- **and all other active Riot routing regions**
+
+Region is automatically detected based on your Riot ID (`gameName#tagLine`), so **no manual input is required**.
+
 League Insights AI is a full-stack web application that analyzes your League of Legends match history, providing deep insights into your gameplay patterns, strengths, weaknesses, and playstyle using advanced timeline analysis and AI-generated narratives powered by AWS Bedrock (Claude).
 
 [![Live Demo](https://img.shields.io/badge/demo-live-brightgreen)](https://your-deployment-url.vercel.app)
