@@ -2,6 +2,17 @@
 
 **Are You The Problem?** Find out with AI-powered analytics for your League of Legends performance.
 
+## ⚠️ Demo Note (Pre-Cached Players)
+
+To ensure fast loading during demos, judging, and public testing, this app uses **pre-cached match data for the following 4 players**:
+
+- **EMP#2005**
+- **Ash#69420**
+- **GoreToBore#000**
+- **shamt#FUMED**
+
+Searching any other Riot IDs will trigger **full year-long match-history aggregation**, which may result in **significantly longer loading times** depending on the number of games played.
+
 League Insights AI is a full-stack web application that analyzes your League of Legends match history, providing deep insights into your gameplay patterns, strengths, weaknesses, and playstyle using advanced timeline analysis and AI-generated narratives powered by AWS Bedrock (Claude).
 
 [![Live Demo](https://img.shields.io/badge/demo-live-brightgreen)](https://your-deployment-url.vercel.app)
