@@ -39,7 +39,7 @@ Region is automatically detected based on your Riot ID (`gameName#tagLine`), so 
 
 League Insights AI is a full-stack web application that analyzes your League of Legends match history, providing deep insights into your gameplay patterns, strengths, weaknesses, and playstyle using advanced timeline analysis and AI-generated narratives powered by AWS Bedrock (Claude).
 
-[![Live Demo](https://img.shields.io/badge/demo-live-brightgreen)](https://your-deployment-url.vercel.app)
+[![Live Demo](https://img.shields.io/badge/demo-live-brightgreen)]([https://your-deployment-url.vercel.app](https://league-insights-ai.vercel.app/))
 [![Backend](https://img.shields.io/badge/backend-Flask-blue)](https://github.com/JihanChowdhury334/League-Insights-AI)
 [![Frontend](https://img.shields.io/badge/frontend-Next.js-black)](https://github.com/JihanChowdhury334/League-Insights-AI)
 
