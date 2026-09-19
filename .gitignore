@@ -19,6 +19,5 @@ venv/
 migrations/versions/*.pyc
 
 # Miscellaneous
-*.txt
 .DS_Store
 Thumbs.db

@@ -9,7 +9,11 @@ import {
   ProcessTimelinesResponse,
 } from "./types";
 
-const BASE_URL = "https://league-insights-ai.up.railway.app/";
+// Configured per environment; the trailing slash is stripped so callers can
+// always write `${BASE_URL}/path` without producing a `//` in the URL.
+const BASE_URL = (
+  process.env.NEXT_PUBLIC_API_URL ?? "https://league-insights-ai.up.railway.app"
+).replace(/\/+$/, "");
 
 // ============================================
 // Helper: Fetch with error handling
@@ -17,13 +21,44 @@ const BASE_URL = "https://league-insights-ai.up.railway.app/";
 
 async function fetchAPI<T>(endpoint: string): Promise<T> {
   const response = await fetch(`${BASE_URL}${endpoint}`);
-  
+
   if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`API Error: ${response.status} - ${errorText}`);
+    throw new Error(await describeError(response));
   }
-  
+
   return response.json();
+}
+
+/**
+ * Surface the backend's own error message instead of a raw status dump.
+ * The API returns `{ "error": "..." }`, so an expired key or an unknown Riot ID
+ * can be shown to the user verbatim rather than as "API Error: 502 - {...}".
+ */
+async function describeError(response: Response): Promise<string> {
+  const body = await response.text();
+  try {
+    const parsed = JSON.parse(body);
+    if (parsed?.error) return parsed.error;
+  } catch {
+    // Not JSON -- fall through to the raw text.
+  }
+  return `Request failed (${response.status}): ${body.slice(0, 200)}`;
+}
+
+/**
+ * Build a query string for the player-scoped endpoints.
+ *
+ * `region` is deliberately optional and omitted when absent: the backend
+ * resolves the correct Riot routing cluster itself (via Riot's region endpoint,
+ * the tagLine, then a probe across all four clusters). Sending a hardcoded
+ * "americas" would override that detection and strand every non-Americas
+ * player on the wrong cluster, which returns an empty match list rather than
+ * an error. Pass it only when the user has explicitly chosen a region.
+ */
+function playerQuery(gameName: string, tagLine: string, region?: string): string {
+  const params = new URLSearchParams({ gameName, tagLine });
+  if (region) params.set("region", region);
+  return params.toString();
 }
 
 // ============================================
@@ -33,10 +68,9 @@ async function fetchAPI<T>(endpoint: string): Promise<T> {
 export async function getStats(
   gameName: string,
   tagLine: string,
-  region: string = "americas"
+  region?: string
 ): Promise<GetStatsResponse> {
-  const endpoint = `/get-stats?gameName=${encodeURIComponent(gameName)}&tagLine=${encodeURIComponent(tagLine)}&region=${region}`;
-  return fetchAPI<GetStatsResponse>(endpoint);
+  return fetchAPI<GetStatsResponse>(`/get-stats?${playerQuery(gameName, tagLine, region)}`);
 }
 
 // ============================================
@@ -46,10 +80,9 @@ export async function getStats(
 export async function processTimelines(
   gameName: string,
   tagLine: string,
-  region: string = "americas"
+  region?: string
 ): Promise<ProcessTimelinesResponse> {
-  const endpoint = `/process-timelines?gameName=${encodeURIComponent(gameName)}&tagLine=${encodeURIComponent(tagLine)}&region=${region}`;
-  return fetchAPI<ProcessTimelinesResponse>(endpoint);
+  return fetchAPI<ProcessTimelinesResponse>(`/process-timelines?${playerQuery(gameName, tagLine, region)}`);
 }
 
 // ============================================
@@ -59,10 +92,9 @@ export async function processTimelines(
 export async function getTimelineStats(
   gameName: string,
   tagLine: string,
-  region: string = "americas"
+  region?: string
 ): Promise<GetTimelineStatsResponse> {
-  const endpoint = `/get-timeline-stats?gameName=${encodeURIComponent(gameName)}&tagLine=${encodeURIComponent(tagLine)}&region=${region}`;
-  return fetchAPI<GetTimelineStatsResponse>(endpoint);
+  return fetchAPI<GetTimelineStatsResponse>(`/get-timeline-stats?${playerQuery(gameName, tagLine, region)}`);
 }
 
 // ============================================
@@ -72,21 +104,20 @@ export async function getTimelineStats(
 export async function generateRecap(
   gameName: string,
   tagLine: string,
-  region: string = "americas"
+  region?: string
 ): Promise<GenerateRecapResponse> {
   const response = await fetch(`${BASE_URL}/generate-recap`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ gameName, tagLine, region }),
+    body: JSON.stringify(region ? { gameName, tagLine, region } : { gameName, tagLine }),
   });
   
   if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`API Error: ${response.status} - ${errorText}`);
+    throw new Error(await describeError(response));
   }
-  
+
   return response.json();
 }
 
@@ -97,7 +128,7 @@ export async function generateRecap(
 export async function fetchAllData(
   gameName: string,
   tagLine: string,
-  region: string = "americas",
+  region?: string,
   onProgress?: (step: string) => void
 ) {
   try {

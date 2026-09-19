@@ -1,38 +1,48 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import requests
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
-from time import sleep
 from datetime import datetime, timedelta
 import asyncio
 import aiohttp
 from collections import defaultdict
 from psycopg2.extras import execute_values
 import psycopg2
-from sqlalchemy.schema import UniqueConstraint
 import boto3
 import json
 import traceback
 from botocore.exceptions import ClientError
 
-# Explicitly specify the .env file path to ensure it's loaded correctly
-load_dotenv(dotenv_path=".env")
+import riot
+
+# Load .env relative to this file so the working directory does not matter.
+# riot.py loads it too, so the key is populated before it is imported.
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 
 # Initialize Flask app
 app = Flask(__name__)
 CORS(app)
 
-# Riot API key (Reminder: Store this in a .env file for security!)
-RIOT_API_KEY = os.getenv("RIOT_API_KEY", "RGAPI-ab034026-0b86-4bc1-9d26-90762153f017")
+# Riot API credentials and routing live in riot.py. The key is read from the
+# environment only -- never hardcoded -- so it can be rotated without a deploy.
 
 # AWS Bedrock Model ID
-BEDROCK_MODEL_ID = "anthropic.claude-3-haiku-20240307-v1:0"
+BEDROCK_MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
 
-# Debugging: Print the loaded API key (masked) to verify it's being loaded correctly
-print(f"Loaded API Key: {RIOT_API_KEY[:8]}...masked")
+# Safety bound on Match-V5 ID pagination (100 IDs per page).
+MAX_MATCH_PAGES = int(os.getenv("MAX_MATCH_PAGES", "50"))
+
+try:
+    riot.validate_api_key()
+    print(f"Riot API key loaded: {riot.masked_api_key()}")
+except riot.RiotConfigError as exc:
+    # Warn loudly but keep booting: /health reports the bad config, and the
+    # non-Riot endpoints still work. A hard exit here would make a missing env
+    # var look like a crashed deploy.
+    print(f"CONFIG ERROR: {exc}")
 
 # Add database configuration
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URL")
@@ -146,6 +156,38 @@ def home():
     """Returns a status message indicating the backend is online."""
     return jsonify({"status": "Rift Rewind Backend Online"})
 
+
+@app.route("/health")
+def health():
+    """Report which dependencies are actually configured.
+
+    Deploys used to fail opaquely -- a missing key or database URL only showed
+    up as a 500 from a data endpoint. This makes misconfiguration greppable
+    from a single request, without ever echoing the secrets themselves.
+    """
+    try:
+        riot.validate_api_key()
+        riot_status = "ok"
+    except riot.RiotConfigError as exc:
+        riot_status = f"error: {exc}"
+
+    try:
+        db.session.execute(db.text("SELECT 1"))
+        db_status = "ok"
+    except Exception as exc:
+        db_status = f"error: {type(exc).__name__}"
+
+    checks = {
+        "riot_api_key": riot_status,
+        "riot_api_key_fingerprint": riot.masked_api_key(),
+        "database": db_status,
+        "bedrock": "ok" if bedrock else "not configured",
+    }
+    healthy = riot_status == "ok" and db_status == "ok"
+    return jsonify({"status": "healthy" if healthy else "degraded", "checks": checks}), (
+        200 if healthy else 503
+    )
+
 # Helper to reset database connection
 def reset_db_connection():
     try:
@@ -158,46 +200,49 @@ def reset_db_connection():
         pass
 
 
-# New helper function to fetch active region from Riot API
-async def get_active_region(session, puuid):
-    """Fetch the active region for a given PUUID using Riot's region endpoint."""
-    try:
-        region_url = f"https://americas.api.riotgames.com/riot/account/v1/region/by-game/lol/by-puuid/{puuid}"
-        async with session.get(region_url, headers={"X-Riot-Token": RIOT_API_KEY}) as response:
-            if response.status == 200:
-                data = await response.json()
-                region = data.get("region")
-                if region:
-                    print(f"Active region detected for {puuid}: {region}")
-                    return region.upper()
-                return None
-            else:
-                print(f"Failed to fetch active region for {puuid}: status {response.status}")
-                return None
-    except Exception as e:
-        print(f"Error fetching active region for {puuid}: {e}")
-        return None
+# Regional routing is resolved in riot.py. These thin wrappers keep the call
+# sites readable and give the endpoints one shared entry point.
+async def resolve_routing(session, puuid, tag_line=None, requested_region=None):
+    """Return the Match-V5 routing cluster for a player."""
+    return await riot.resolve_cluster(
+        session, puuid, tag_line=tag_line, requested_region=requested_region
+    )
 
-# Routing resolver function
-def get_routing_cluster(tag_line: str = None, active_region: str = None) -> str:
-    """Return 'americas' | 'europe' | 'asia' | 'sea' from a Riot region/tagLine like NA1, EUW1, KR, OC1, SG2, PH2, ME1, etc."""
-    # If we have an active_region from the API, use it first
-    if active_region:
-        t = active_region.upper()
-    else:
-        t = (tag_line or "").upper()
 
-    americas = {"NA", "NA1", "BR", "BR1", "LA1", "LA2", "LAN", "LAS"}
-    europe   = {"EUW", "EUW1", "EUN1", "EUNE", "TR1", "TR", "RU", "ME1"}
-    asia     = {"KR", "JP1", "JP"}
-    sea      = {"OC1", "OCE", "SG2", "PH2", "TW2", "VN2", "TH2"}
+# Riot status -> (client-facing message, status we return to the browser).
+# riot.py uses 599 internally for "never got a response"; that is not a real
+# HTTP status, so it is translated to 502 before it reaches a client.
+ACCOUNT_ERRORS = {
+    401: ("Riot API key is missing or malformed.", 500),
+    403: ("Riot API key is invalid or expired.", 502),
+    404: ("Riot ID not found. Check the name and tag.", 404),
+    429: ("Rate limited by the Riot API. Try again shortly.", 429),
+    599: ("Could not reach the Riot API.", 502),
+}
 
-    if t in americas: return "americas"
-    if t in europe:   return "europe"
-    if t in asia:     return "asia"
-    if t in sea:      return "sea"
-    # Safe fallback
-    return "americas"
+
+def account_failure(status):
+    """Turn an Account-V1 failure into a specific ``(body, status)`` pair.
+
+    The endpoints previously returned a generic "Failed to fetch account" for
+    every non-200, which made an expired key and a typo'd Riot ID look
+    identical from the frontend. A bad key is also our fault, not the caller's,
+    so it is reported as a 5xx rather than passing Riot's 403 straight through.
+    """
+    message, http_status = ACCOUNT_ERRORS.get(
+        status, (f"Failed to fetch account data (HTTP {status}).", 502)
+    )
+    return {"error": message}, http_status
+
+
+def requested_region_arg():
+    """Read the optional ``region`` query parameter.
+
+    The frontend has always sent this; the backend previously ignored it, so a
+    user on a non-Americas server had no way to correct a bad guess.
+    """
+    return request.args.get("region")
+
 
 # Updated `/get-stats` endpoint to use dynamic routing
 @app.route("/get-stats", methods=["GET"])
@@ -205,31 +250,28 @@ async def get_stats():
     """Fetches stats for the last year, updates the database incrementally, and generates insights."""
     game_name = request.args.get("gameName")
     tag_line = request.args.get("tagLine")
+    region_param = requested_region_arg()
 
     if not game_name or not tag_line:
         return jsonify({"error": "Missing required parameters: gameName and tagLine."}), 400
 
     try:
-        async with aiohttp.ClientSession() as session:
+        async with riot.new_session() as session:
             # Step 1: Get PUUID using Riot Account-V1 API
-            account_url = f"https://americas.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}"
-            async with session.get(account_url, headers={"X-Riot-Token": RIOT_API_KEY}) as account_response:
-                if account_response.status == 403:
-                    return jsonify({"error": "Invalid or expired API key."}), 403
-                elif account_response.status == 404:
-                    return jsonify({"error": "Account not found."}), 404
-                elif account_response.status != 200:
-                    return jsonify({"error": "Failed to fetch account data."}), account_response.status
+            account = await riot.fetch_account(session, game_name, tag_line)
+            if not account.ok:
+                body, http_status = account_failure(account.status)
+                return jsonify(body), http_status
 
-                account_data = await account_response.json()
-                puuid = account_data.get("puuid")
+            puuid = (account.data or {}).get("puuid")
+            if not puuid:
+                return jsonify({"error": "PUUID not found in account data."}), 500
 
-                if not puuid:
-                    return jsonify({"error": "PUUID not found in account data."}), 500
-
-            # Get active region from Riot API
-            active_region = await get_active_region(session, puuid)
-            routing = get_routing_cluster(tag_line=tag_line, active_region=active_region)
+            # Resolve the routing cluster that actually serves this player.
+            routing = await resolve_routing(
+                session, puuid, tag_line=tag_line, requested_region=region_param
+            )
+            print(f"[STATS] Routing cluster: {routing}")
 
             # Step 2: Determine the start time for fetching matches
             last_match = Match.query.filter_by(puuid=puuid).order_by(Match.timestamp.desc()).first()
@@ -246,31 +288,20 @@ async def get_stats():
 
             async def fetch_match_ids(start):
                 paginated_url = f"{matches_url}?startTime={start_time}&start={start}&count=100"
-                retries = 0
-                while retries < 5:
-                    async with session.get(paginated_url, headers={"X-Riot-Token": RIOT_API_KEY}) as matches_response:
-                        if matches_response.status == 429:
-                            retry_after = int(matches_response.headers.get("Retry-After", 120))
-                            print(f"Rate limit hit. Retrying after {retry_after} seconds.")
-                            await asyncio.sleep(retry_after)
-                            retries += 1
-                            continue
-                        elif matches_response.status in {400, 401, 403, 404, 405, 415, 500, 502, 503, 504}:
-                            print(f"Error fetching match IDs. HTTP Status: {matches_response.status}")
-                            return []
-                        elif matches_response.status != 200:
-                            print(f"Unexpected error. HTTP Status: {matches_response.status}")
-                            return []
-                        return await matches_response.json()
-                    retries += 1
-                    await asyncio.sleep(2 ** retries)  # Exponential backoff
-                print("Max retries reached for fetching match IDs.")
+                response = await riot.riot_get(session, paginated_url, label="match-ids")
+                if response.ok:
+                    return response.data or []
+                print(f"Error fetching match IDs. HTTP Status: {response.status}")
                 return []
 
             request_count = 0
             start_time_window = datetime.now()
 
-            while True:
+            # Bound the pagination. The loop previously only exited on an empty
+            # page, so an upstream that keeps returning IDs would pin the worker
+            # indefinitely. MAX_MATCH_PAGES pages x 100 IDs is far more than a
+            # year of games for any human player.
+            for page in range(MAX_MATCH_PAGES):
                 # Check rate limits
                 if request_count >= 20:
                     elapsed_time = (datetime.now() - start_time_window).total_seconds()
@@ -287,8 +318,15 @@ async def get_stats():
                     break
                 match_ids.extend(batch_ids)
                 print(f"Fetched {len(batch_ids)} matches in this batch. Total so far: {len(match_ids)}")
+
+                if len(batch_ids) < 100:
+                    # A short page is the last page; skip the extra round trip.
+                    break
+
                 await asyncio.sleep(1.2)  # small delay between ID pages
                 start += 100
+            else:
+                print(f"Reached the {MAX_MATCH_PAGES}-page cap; stopping pagination.")
 
             # Debugging: Log the total number of match IDs fetched
             print(f"Total match IDs fetched: {len(match_ids)}")
@@ -321,97 +359,86 @@ async def get_stats():
             # Define the detail fetcher
             async def fetch_match_details(match_id, session, puuid):
                 match_url = f"https://{routing}.api.riotgames.com/lol/match/v5/matches/{match_id}"
-                retries = 0
-                while retries < 5:
-                    async with session.get(match_url, headers={"X-Riot-Token": RIOT_API_KEY}) as match_response:
-                        if match_response.status == 429:
-                            retry_after = int(match_response.headers.get("Retry-After", 120))
-                            print(f"Rate limit hit for {match_id}, retrying in {retry_after}s")
-                            await asyncio.sleep(retry_after)
-                            retries += 1
-                            continue
-                        if match_response.status != 200:
-                            print(f"Failed match {match_id}, status {match_response.status}")
-                            return None
-                        match_data = await match_response.json()
-                        info = match_data.get("info", {})
-                        participants = info.get("participants", [])
-                        teams = info.get("teams", [])
+                response = await riot.riot_get(session, match_url, label="match")
+                if not response.ok:
+                    print(f"Failed match {match_id}, status {response.status}")
+                    return None
 
-                        # Locate the participant with the matching PUUID
-                        participant = next((p for p in participants if p["puuid"] == puuid), None)
-                        if not participant:
-                            print(f"No participant for {puuid} in match {match_id}")
-                            return None
+                match_data = response.data or {}
+                info = match_data.get("info", {})
+                participants = info.get("participants", [])
+                teams = info.get("teams", [])
 
-                        # Compute team totals
-                        team_id = participant["teamId"]
-                        team_participants = [p for p in participants if p["teamId"] == team_id]
-                        team_kills = sum(p["kills"] for p in team_participants)
-                        team_damage = sum(p["totalDamageDealtToChampions"] for p in team_participants)
-                        team_gold = sum(p["goldEarned"] for p in team_participants)
-                        team_vision = sum(p["visionScore"] for p in team_participants)
+                # Locate the participant with the matching PUUID
+                participant = next((p for p in participants if p["puuid"] == puuid), None)
+                if not participant:
+                    print(f"No participant for {puuid} in match {match_id}")
+                    return None
 
-                        # Extract objective stats
-                        team_objectives = next((t for t in teams if t["teamId"] == team_id), {}).get("objectives", {})
-                        dragons = team_objectives.get("dragon", {}).get("kills", 0)
-                        barons = team_objectives.get("baron", {}).get("kills", 0)
-                        heralds = team_objectives.get("riftHerald", {}).get("kills", 0)
-                        towers = team_objectives.get("tower", {}).get("kills", 0)
-                        inhibitors = team_objectives.get("inhibitor", {}).get("kills", 0)
+                # Compute team totals
+                team_id = participant["teamId"]
+                team_participants = [p for p in participants if p["teamId"] == team_id]
+                team_kills = sum(p["kills"] for p in team_participants)
+                team_damage = sum(p["totalDamageDealtToChampions"] for p in team_participants)
+                team_gold = sum(p["goldEarned"] for p in team_participants)
+                team_vision = sum(p["visionScore"] for p in team_participants)
 
-                        # Return a Match instance with all fields populated
-                        return Match(
-                            id=match_id,
-                            game_mode=info.get("gameMode", "UNKNOWN"),
-                            duration=info.get("gameDuration", 0),
-                            win=participant.get("win", False),
-                            timestamp=info.get("gameStartTimestamp", 0),
+                # Extract objective stats
+                team_objectives = next((t for t in teams if t["teamId"] == team_id), {}).get("objectives", {})
+                dragons = team_objectives.get("dragon", {}).get("kills", 0)
+                barons = team_objectives.get("baron", {}).get("kills", 0)
+                heralds = team_objectives.get("riftHerald", {}).get("kills", 0)
+                towers = team_objectives.get("tower", {}).get("kills", 0)
+                inhibitors = team_objectives.get("inhibitor", {}).get("kills", 0)
 
-                            # Identity
-                            role=participant.get("teamPosition", "UNKNOWN"),
-                            champion=participant.get("championName", "Unknown"),
-                            puuid=puuid,
+                # Return a Match instance with all fields populated
+                return Match(
+                    id=match_id,
+                    game_mode=info.get("gameMode", "UNKNOWN"),
+                    duration=info.get("gameDuration", 0),
+                    win=participant.get("win", False),
+                    timestamp=info.get("gameStartTimestamp", 0),
 
-                            # Core Combat Stats
-                            kills=participant.get("kills", 0),
-                            deaths=participant.get("deaths", 0),
-                            assists=participant.get("assists", 0),
-                            damage=participant.get("totalDamageDealtToChampions", 0),
-                            damage_taken=participant.get("totalDamageTaken", 0),
-                            time_dead=participant.get("totalTimeSpentDead", 0),
+                    # Identity
+                    role=participant.get("teamPosition", "UNKNOWN"),
+                    champion=participant.get("championName", "Unknown"),
+                    puuid=puuid,
 
-                            # Economy
-                            gold=participant.get("goldEarned", 0),
+                    # Core Combat Stats
+                    kills=participant.get("kills", 0),
+                    deaths=participant.get("deaths", 0),
+                    assists=participant.get("assists", 0),
+                    damage=participant.get("totalDamageDealtToChampions", 0),
+                    damage_taken=participant.get("totalDamageTaken", 0),
+                    time_dead=participant.get("totalTimeSpentDead", 0),
 
-                            # Farming
-                            cs=participant.get("totalMinionsKilled", 0),
-                            neutral_cs=participant.get("neutralMinionsKilled", 0),
-                            enemy_jungle_cs=participant.get("totalEnemyJungleMinionsKilled", 0),
-                            ally_jungle_cs=participant.get("totalAllyJungleMinionsKilled", 0),
+                    # Economy
+                    gold=participant.get("goldEarned", 0),
 
-                            # Vision
-                            vision=participant.get("visionScore", 0),
-                            wards_placed=participant.get("wardsPlaced", 0),
-                            wards_killed=participant.get("wardsKilled", 0),
+                    # Farming
+                    cs=participant.get("totalMinionsKilled", 0),
+                    neutral_cs=participant.get("neutralMinionsKilled", 0),
+                    enemy_jungle_cs=participant.get("totalEnemyJungleMinionsKilled", 0),
+                    ally_jungle_cs=participant.get("totalAllyJungleMinionsKilled", 0),
 
-                            # Objectives
-                            dragons=dragons,
-                            barons=barons,
-                            heralds=heralds,
-                            towers=towers,
-                            inhibitors=inhibitors,
+                    # Vision
+                    vision=participant.get("visionScore", 0),
+                    wards_placed=participant.get("wardsPlaced", 0),
+                    wards_killed=participant.get("wardsKilled", 0),
 
-                            # Team Totals
-                            team_kills=team_kills,
-                            team_damage=team_damage,
-                            team_gold=team_gold,
-                            team_vision=team_vision
-                        )
-                    retries += 1
-                    await asyncio.sleep(2 ** retries)
-                print(f"Max retries reached for match {match_id}")
-                return None
+                    # Objectives
+                    dragons=dragons,
+                    barons=barons,
+                    heralds=heralds,
+                    towers=towers,
+                    inhibitors=inhibitors,
+
+                    # Team Totals
+                    team_kills=team_kills,
+                    team_damage=team_damage,
+                    team_gold=team_gold,
+                    team_vision=team_vision
+                )
 
             # --- Limit concurrency to avoid 429 ---
             semaphore = asyncio.Semaphore(15)
@@ -883,6 +910,7 @@ async def process_timelines():
     """Process timeline insights for all existing matches in the database."""
     game_name = request.args.get("gameName")
     tag_line = request.args.get("tagLine")
+    region_param = requested_region_arg()
 
     print(f"[TIMELINE] ==================== STARTING TIMELINE PROCESSING ====================")
     print(f"[TIMELINE] Fetching account data for gameName={game_name} tagLine={tag_line}")
@@ -892,33 +920,24 @@ async def process_timelines():
         return jsonify({"error": "Missing required parameters: gameName and tagLine."}), 400
 
     try:
-        async with aiohttp.ClientSession() as session:
+        async with riot.new_session() as session:
             # Step 1: Get PUUID using Riot Account-V1 API
-            account_url = f"https://americas.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}"
-            print(f"[TIMELINE] Account API URL: {account_url}")
-            
-            try:
-                async with session.get(account_url, headers={"X-Riot-Token": RIOT_API_KEY}) as account_response:
-                    print(f"[TIMELINE] Account response status: {account_response.status}")
-                    if account_response.status != 200:
-                        print(f"[TIMELINE] ERROR: Failed to fetch account, status={account_response.status}")
-                        return jsonify({"error": "Failed to fetch account"}), account_response.status
-                    account_data = await account_response.json()
-                    puuid = account_data.get("puuid")
-                    if not puuid:
-                        print("[TIMELINE] ERROR: PUUID not found in response")
-                        return jsonify({"error": "PUUID not found"}), 500
-                    print(f"[TIMELINE] PUUID resolved: {puuid}")
-            except Exception as e:
-                print(f"[TIMELINE] ERROR: Exception during account fetch: {e}")
-                raise
+            account = await riot.fetch_account(session, game_name, tag_line)
+            if not account.ok:
+                print(f"[TIMELINE] ERROR: account lookup failed, status={account.status}")
+                body, http_status = account_failure(account.status)
+                return jsonify(body), http_status
 
-            # Get active region and routing
-            print(f"[TIMELINE] Fetching active region for PUUID={puuid}")
-            active_region = await get_active_region(session, puuid)
-            print(f"[TIMELINE] Active region: {active_region}")
-            
-            routing = get_routing_cluster(tag_line=tag_line, active_region=active_region)
+            puuid = (account.data or {}).get("puuid")
+            if not puuid:
+                print("[TIMELINE] ERROR: PUUID not found in response")
+                return jsonify({"error": "PUUID not found"}), 500
+            print(f"[TIMELINE] PUUID resolved: {puuid}")
+
+            # Resolve the routing cluster that actually serves this player.
+            routing = await resolve_routing(
+                session, puuid, tag_line=tag_line, requested_region=region_param
+            )
             print(f"[TIMELINE] Routing cluster: {routing}")
 
             # Step 2: Get ALL match_ids from database for this PUUID
@@ -952,277 +971,268 @@ async def process_timelines():
                 print(f"[TIMELINE] Processing match {match_id} ({index}/{total})")
                 timeline_url = f"https://{routing}.api.riotgames.com/lol/match/v5/matches/{match_id}/timeline"
                 print(f"[TIMELINE] Fetching timeline URL: {timeline_url}")
-                retries = 0
-                
-                while retries < 5:
-                    try:
-                        async with session.get(timeline_url, headers={"X-Riot-Token": RIOT_API_KEY}) as response:
-                            print(f"[TIMELINE] Timeline status {response.status} for match {match_id}")
-                            if response.status == 429:
-                                retry_after = int(response.headers.get("Retry-After", 120))
-                                print(f"[TIMELINE] Rate limit hit for {match_id}, retrying in {retry_after}s")
-                                await asyncio.sleep(retry_after)
-                                retries += 1
-                                continue
-                            elif response.status != 200:
-                                print(f"[TIMELINE] ERROR: Failed to fetch timeline for {match_id}: {response.status}")
-                                return None
-                            
-                            timeline = await response.json()
-                            print(f"[TIMELINE] Timeline data received for {match_id}")
-                            
-                            # Extract participant mappings
-                            print(f"[TIMELINE] Extracting participant->puuid map for {match_id}")
-                            info = timeline.get("info", {})
-                            if not info:
-                                print(f"[TIMELINE] ERROR: No 'info' key in timeline for {match_id}")
-                                return None
-                            
-                            participants_meta = info.get("participants", [])
-                            if not participants_meta:
-                                print(f"[TIMELINE] ERROR: No participants metadata for {match_id}")
-                                return None
-                            
-                            pid_to_puuid = {p["participantId"]: p["puuid"] for p in participants_meta}
-                            print(f"[TIMELINE] Built participantId->PUUID map with {len(pid_to_puuid)} entries")
-                            
-                            my_pid = next((pid for pid, p in pid_to_puuid.items() if p == puuid), None)
-                            if not my_pid:
-                                print(f"[TIMELINE] ERROR: Player PUUID {puuid} not found in match {match_id}")
-                                return None
-                            print(f"[TIMELINE] my_pid resolved = {my_pid}")
+                response = await riot.riot_get(
+                    session, timeline_url, label="timeline"
+                )
+                if not response.ok:
+                    print(
+                        f"[TIMELINE] ERROR: Failed to fetch timeline for "
+                        f"{match_id}: {response.status}"
+                    )
+                    return None
 
-                            # Fetch match data to get team info
-                            match_data = None
-                            participants = []
-                            my_team_id = None
-                            
-                            match_url = f"https://{routing}.api.riotgames.com/lol/match/v5/matches/{match_id}"
-                            print(f"[TIMELINE] Fetching match data URL: {match_url}")
-                            try:
-                                async with session.get(match_url, headers={"X-Riot-Token": RIOT_API_KEY}) as m_response:
-                                    print(f"[TIMELINE] Match data status: {m_response.status}")
-                                    if m_response.status == 200:
-                                        match_data = await m_response.json()
-                                        participants = match_data.get("info", {}).get("participants", [])
-                                        print(f"[TIMELINE] Got {len(participants)} participants from match data")
-                                        my_team_id = next((p.get("teamId") for p in participants if p.get("puuid") == puuid), None)
-                                        print(f"[TIMELINE] my_team_id resolved = {my_team_id}")
-                                    else:
-                                        print(f"[TIMELINE] WARNING: Failed to fetch match data, status={m_response.status}")
-                            except Exception as e:
-                                print(f"[TIMELINE] ERROR: Exception fetching match data: {e}")
+                print(f"[TIMELINE] Timeline data received for {match_id}")
 
-                            # Process frames
-                            frames = info.get("frames", [])
-                            print(f"[TIMELINE] Frames count: {len(frames)}")
-                            
-                            gold_diffs = []
-                            level_6_time = None
-                            level_11_time = None
-                            level_16_time = None
-                            positions = []
-                            
-                            for frame_idx, frame in enumerate(frames):
-                                ts = frame.get("timestamp", 0)
-                                if frame_idx % 50 == 0:
-                                    print(f"[TIMELINE] Frame {frame_idx}: ts={ts}")
-                                
-                                pf_all = frame.get("participantFrames", {})
-                                if not pf_all:
-                                    if frame_idx % 50 == 0:
-                                        print(f"[TIMELINE] WARNING: No participantFrames at frame {frame_idx}")
-                                    continue
-                                
-                                if frame_idx % 50 == 0:
-                                    print(f"[TIMELINE] pf keys: {list(pf_all.keys())}")
-                                
-                                pf = pf_all.get(str(my_pid))
-                                if not pf:
-                                    if frame_idx % 50 == 0:
-                                        print(f"[TIMELINE] WARNING: No data for my_pid={my_pid} at frame {frame_idx}")
-                                    continue
-                                
-                                # Track level milestones
-                                level = pf.get("level", 1)
-                                if level >= 6 and level_6_time is None:
-                                    level_6_time = ts
-                                    print(f"[TIMELINE] MILESTONE: Level 6 reached at {ts}ms")
-                                if level >= 11 and level_11_time is None:
-                                    level_11_time = ts
-                                    print(f"[TIMELINE] MILESTONE: Level 11 reached at {ts}ms")
-                                if level >= 16 and level_16_time is None:
-                                    level_16_time = ts
-                                    print(f"[TIMELINE] MILESTONE: Level 16 reached at {ts}ms")
-                                
-                                # Calculate gold diff
-                                my_gold = int(pf.get("totalGold", 0))
-                                enemy_golds = []
-                                
-                                for pid_str, other_pf in pf_all.items():
-                                    pid_int = int(pid_str)
-                                    if pid_int == my_pid:
-                                        continue
-                                    
-                                    other_puuid = pid_to_puuid.get(pid_int)
-                                    if other_puuid and match_data and my_team_id:
-                                        for p in participants:
-                                            if p.get("puuid") == other_puuid and p.get("teamId") != my_team_id:
-                                                enemy_golds.append(int(other_pf.get("totalGold", 0)))
-                                                break
-                                
-                                if enemy_golds:
-                                    avg_enemy_gold = sum(enemy_golds) // len(enemy_golds)
-                                    gold_diff = my_gold - avg_enemy_gold
-                                    gold_diffs.append((ts, gold_diff))
-                                    if frame_idx % 50 == 0:
-                                        print(f"[TIMELINE] Frame {frame_idx}: my_gold={my_gold} enemy_gold_avg={avg_enemy_gold} diff={gold_diff}")
-                                
-                                # Track position for roam score
-                                pos = pf.get("position", {})
-                                if pos.get("x") is not None and pos.get("y") is not None:
-                                    positions.append((pos.get("x"), pos.get("y")))
+                try:
+                    timeline = response.data or {}
 
-                            print(f"[TIMELINE] Completed frame processing. Total gold_diffs: {len(gold_diffs)}, positions: {len(positions)}")
-
-                            # Process events
-                            print(f"[TIMELINE] Processing events for {match_id}")
-                            kill_positions = []
-                            objective_counts = {"dragon": 0, "baron": 0, "herald": 0, "tower": 0, "inhibitor": 0}
-                            
-                            for frame in frames:
-                                for event in frame.get("events", []):
-                                    event_type = event.get("type")
-                                    
-                                    if event_type == "CHAMPION_KILL":
-                                        killer_pid = event.get("killerId")
-                                        if killer_pid == my_pid:
-                                            pos = event.get("position", {})
-                                            if pos.get("x") is not None and pos.get("y") is not None:
-                                                kill_positions.append({"x": pos.get("x"), "y": pos.get("y")})
-                                                print(f"[EVENT] Kill at x={pos.get('x')} y={pos.get('y')}")
-                                    
-                                    elif event_type == "ELITE_MONSTER_KILL" and my_team_id:
-                                        killer_pid = event.get("killerId")
-                                        killer_puuid = pid_to_puuid.get(killer_pid)
-                                        if killer_puuid:
-                                            killer_team = next((p.get("teamId") for p in participants if p.get("puuid") == killer_puuid), None)
-                                            if killer_team == my_team_id:
-                                                monster_type = event.get("monsterType", "").lower()
-                                                if "dragon" in monster_type:
-                                                    objective_counts["dragon"] += 1
-                                                    print(f"[EVENT] Dragon +1 (total: {objective_counts['dragon']})")
-                                                elif "baron" in monster_type:
-                                                    objective_counts["baron"] += 1
-                                                    print(f"[EVENT] Baron +1 (total: {objective_counts['baron']})")
-                                                elif "herald" in monster_type or "riftherald" in monster_type:
-                                                    objective_counts["herald"] += 1
-                                                    print(f"[EVENT] Herald +1 (total: {objective_counts['herald']})")
-                                    
-                                    elif event_type == "BUILDING_KILL" and my_team_id:
-                                        killer_pid = event.get("killerId")
-                                        killer_puuid = pid_to_puuid.get(killer_pid)
-                                        if killer_puuid:
-                                            killer_team = next((p.get("teamId") for p in participants if p.get("puuid") == killer_puuid), None)
-                                            if killer_team == my_team_id:
-                                                building_type = event.get("buildingType", "").lower()
-                                                if "tower" in building_type:
-                                                    objective_counts["tower"] += 1
-                                                    print(f"[EVENT] Tower +1 (total: {objective_counts['tower']})")
-                                                elif "inhibitor" in building_type:
-                                                    objective_counts["inhibitor"] += 1
-                                                    print(f"[EVENT] Inhibitor +1 (total: {objective_counts['inhibitor']})")
-
-                            print(f"[TIMELINE] Event processing complete. Kills: {len(kill_positions)}, Objectives: {objective_counts}")
-
-                            # Calculate insights
-                            if not gold_diffs:
-                                print(f"[TIMELINE] ERROR: No gold diffs calculated for {match_id}, cannot compute insights")
-                                return None
-                            
-                            print(f"[TIMELINE] Computing insights for {match_id}")
-                            
-                            # Early dominance (0-10 min)
-                            early_diffs = [diff for ts, diff in gold_diffs if ts <= 600000]
-                            early_dominance = sum(early_diffs) / len(early_diffs) if early_diffs else 0
-                            print(f"[INSIGHT] early_dominance={early_dominance:.2f} (computed from {len(early_diffs)} samples)")
-                            
-                            # Midgame swing (10-20 min)
-                            mid_diffs = [diff for ts, diff in gold_diffs if 600000 < ts <= 1200000]
-                            midgame_swing = max(mid_diffs) - min(mid_diffs) if len(mid_diffs) > 1 else 0
-                            print(f"[INSIGHT] midgame_swing={midgame_swing:.2f} (computed from {len(mid_diffs)} samples)")
-                            
-                            # Consistency score (variance)
-                            all_diffs = [diff for ts, diff in gold_diffs]
-                            mean_diff = sum(all_diffs) / len(all_diffs) if all_diffs else 0
-                            variance = sum((x - mean_diff) ** 2 for x in all_diffs) / len(all_diffs) if all_diffs else 0
-                            consistency = 100 - min(variance / 100, 100)
-                            print(f"[INSIGHT] consistency={consistency:.2f} (variance={variance:.2f}, mean={mean_diff:.2f})")
-                            
-                            # Biggest spike/throw
-                            deltas = [all_diffs[i] - all_diffs[i-1] for i in range(1, len(all_diffs))]
-                            biggest_spike = max(deltas) if deltas else 0
-                            biggest_throw = min(deltas) if deltas else 0
-                            print(f"[INSIGHT] spike={biggest_spike:.2f} throw={biggest_throw:.2f}")
-                            
-                            # Roam score (position changes)
-                            roam_score = 0
-                            if len(positions) > 1:
-                                significant_moves = 0
-                                for i in range(1, len(positions)):
-                                    x1, y1 = positions[i-1]
-                                    x2, y2 = positions[i]
-                                    dist = ((x2-x1)**2 + (y2-y1)**2) ** 0.5
-                                    if dist > 3000:  # Significant movement
-                                        significant_moves += 1
-                                roam_score = significant_moves / (len(positions) / 10)  # Normalize per 10 frames
-                                print(f"[INSIGHT] roam_score={roam_score:.2f} (from {significant_moves} significant moves in {len(positions)} positions)")
-                            else:
-                                print(f"[INSIGHT] roam_score=0 (insufficient position data)")
-                            
-                            # Comeback type
-                            comeback_type = "neutral"
-                            if early_dominance > 100 and all_diffs[-1] > 500:
-                                comeback_type = "dominated"
-                            elif early_dominance < -100 and all_diffs[-1] > 500:
-                                comeback_type = "comeback"
-                            elif early_dominance > 100 and all_diffs[-1] < -500:
-                                comeback_type = "throw"
-                            elif early_dominance < -100 and all_diffs[-1] < -500:
-                                comeback_type = "fell_behind"
-                            print(f"[INSIGHT] comeback_type={comeback_type}")
-                            
-                            result = {
-                                "match_id": match_id,
-                                "puuid": puuid,
-                                "early_dominance_score": round(early_dominance, 2),
-                                "midgame_swing_score": round(midgame_swing, 2),
-                                "consistency_score": round(consistency, 2),
-                                "level_6_timestamp": level_6_time,
-                                "level_11_timestamp": level_11_time,
-                                "level_16_timestamp": level_16_time,
-                                "biggest_spike": round(biggest_spike, 2),
-                                "biggest_throw": round(biggest_throw, 2),
-                                "roam_score": round(roam_score, 2),
-                                "kill_positions": kill_positions,
-                                "objective_presence": objective_counts,
-                                "comeback_type": comeback_type,
-                                "duration": match_duration
-                            }
-                            print(f"[TIMELINE] Successfully processed match {match_id}")
-                            return result
-                    
-                    except Exception as e:
-                        print(f"[TIMELINE] ERROR: Exception processing match {match_id}: {e}")
-                        import traceback
-                        traceback.print_exc()
+                    # Extract participant mappings
+                    print(f"[TIMELINE] Extracting participant->puuid map for {match_id}")
+                    info = timeline.get("info", {})
+                    if not info:
+                        print(f"[TIMELINE] ERROR: No 'info' key in timeline for {match_id}")
                         return None
                     
-                    retries += 1
-                    await asyncio.sleep(2 ** retries)
-                
-                print(f"[TIMELINE] ERROR: Max retries reached for {match_id}")
-                return None
+                    participants_meta = info.get("participants", [])
+                    if not participants_meta:
+                        print(f"[TIMELINE] ERROR: No participants metadata for {match_id}")
+                        return None
+                    
+                    pid_to_puuid = {p["participantId"]: p["puuid"] for p in participants_meta}
+                    print(f"[TIMELINE] Built participantId->PUUID map with {len(pid_to_puuid)} entries")
+                    
+                    my_pid = next((pid for pid, p in pid_to_puuid.items() if p == puuid), None)
+                    if not my_pid:
+                        print(f"[TIMELINE] ERROR: Player PUUID {puuid} not found in match {match_id}")
+                        return None
+                    print(f"[TIMELINE] my_pid resolved = {my_pid}")
+
+                    # Fetch match data to get team info
+                    match_data = None
+                    participants = []
+                    my_team_id = None
+                    
+                    match_url = f"https://{routing}.api.riotgames.com/lol/match/v5/matches/{match_id}"
+                    m_response = await riot.riot_get(session, match_url, label="timeline-match")
+                    if m_response.ok:
+                        match_data = m_response.data or {}
+                        participants = match_data.get("info", {}).get("participants", [])
+                        my_team_id = next(
+                            (p.get("teamId") for p in participants if p.get("puuid") == puuid),
+                            None,
+                        )
+                        print(
+                            f"[TIMELINE] Got {len(participants)} participants; "
+                            f"my_team_id={my_team_id}"
+                        )
+                    else:
+                        print(
+                            f"[TIMELINE] WARNING: Failed to fetch match data, "
+                            f"status={m_response.status}"
+                        )
+
+                    # Process frames
+                    frames = info.get("frames", [])
+                    print(f"[TIMELINE] Frames count: {len(frames)}")
+                    
+                    gold_diffs = []
+                    level_6_time = None
+                    level_11_time = None
+                    level_16_time = None
+                    positions = []
+                    
+                    for frame_idx, frame in enumerate(frames):
+                        ts = frame.get("timestamp", 0)
+                        if frame_idx % 50 == 0:
+                            print(f"[TIMELINE] Frame {frame_idx}: ts={ts}")
+                        
+                        pf_all = frame.get("participantFrames", {})
+                        if not pf_all:
+                            if frame_idx % 50 == 0:
+                                print(f"[TIMELINE] WARNING: No participantFrames at frame {frame_idx}")
+                            continue
+                        
+                        if frame_idx % 50 == 0:
+                            print(f"[TIMELINE] pf keys: {list(pf_all.keys())}")
+                        
+                        pf = pf_all.get(str(my_pid))
+                        if not pf:
+                            if frame_idx % 50 == 0:
+                                print(f"[TIMELINE] WARNING: No data for my_pid={my_pid} at frame {frame_idx}")
+                            continue
+                        
+                        # Track level milestones
+                        level = pf.get("level", 1)
+                        if level >= 6 and level_6_time is None:
+                            level_6_time = ts
+                            print(f"[TIMELINE] MILESTONE: Level 6 reached at {ts}ms")
+                        if level >= 11 and level_11_time is None:
+                            level_11_time = ts
+                            print(f"[TIMELINE] MILESTONE: Level 11 reached at {ts}ms")
+                        if level >= 16 and level_16_time is None:
+                            level_16_time = ts
+                            print(f"[TIMELINE] MILESTONE: Level 16 reached at {ts}ms")
+                        
+                        # Calculate gold diff
+                        my_gold = int(pf.get("totalGold", 0))
+                        enemy_golds = []
+                        
+                        for pid_str, other_pf in pf_all.items():
+                            pid_int = int(pid_str)
+                            if pid_int == my_pid:
+                                continue
+                            
+                            other_puuid = pid_to_puuid.get(pid_int)
+                            if other_puuid and match_data and my_team_id:
+                                for p in participants:
+                                    if p.get("puuid") == other_puuid and p.get("teamId") != my_team_id:
+                                        enemy_golds.append(int(other_pf.get("totalGold", 0)))
+                                        break
+                        
+                        if enemy_golds:
+                            avg_enemy_gold = sum(enemy_golds) // len(enemy_golds)
+                            gold_diff = my_gold - avg_enemy_gold
+                            gold_diffs.append((ts, gold_diff))
+                            if frame_idx % 50 == 0:
+                                print(f"[TIMELINE] Frame {frame_idx}: my_gold={my_gold} enemy_gold_avg={avg_enemy_gold} diff={gold_diff}")
+                        
+                        # Track position for roam score
+                        pos = pf.get("position", {})
+                        if pos.get("x") is not None and pos.get("y") is not None:
+                            positions.append((pos.get("x"), pos.get("y")))
+
+                    print(f"[TIMELINE] Completed frame processing. Total gold_diffs: {len(gold_diffs)}, positions: {len(positions)}")
+
+                    # Process events
+                    print(f"[TIMELINE] Processing events for {match_id}")
+                    kill_positions = []
+                    objective_counts = {"dragon": 0, "baron": 0, "herald": 0, "tower": 0, "inhibitor": 0}
+                    
+                    for frame in frames:
+                        for event in frame.get("events", []):
+                            event_type = event.get("type")
+                            
+                            if event_type == "CHAMPION_KILL":
+                                killer_pid = event.get("killerId")
+                                if killer_pid == my_pid:
+                                    pos = event.get("position", {})
+                                    if pos.get("x") is not None and pos.get("y") is not None:
+                                        kill_positions.append({"x": pos.get("x"), "y": pos.get("y")})
+                                        print(f"[EVENT] Kill at x={pos.get('x')} y={pos.get('y')}")
+                            
+                            elif event_type == "ELITE_MONSTER_KILL" and my_team_id:
+                                killer_pid = event.get("killerId")
+                                killer_puuid = pid_to_puuid.get(killer_pid)
+                                if killer_puuid:
+                                    killer_team = next((p.get("teamId") for p in participants if p.get("puuid") == killer_puuid), None)
+                                    if killer_team == my_team_id:
+                                        monster_type = event.get("monsterType", "").lower()
+                                        if "dragon" in monster_type:
+                                            objective_counts["dragon"] += 1
+                                            print(f"[EVENT] Dragon +1 (total: {objective_counts['dragon']})")
+                                        elif "baron" in monster_type:
+                                            objective_counts["baron"] += 1
+                                            print(f"[EVENT] Baron +1 (total: {objective_counts['baron']})")
+                                        elif "herald" in monster_type or "riftherald" in monster_type:
+                                            objective_counts["herald"] += 1
+                                            print(f"[EVENT] Herald +1 (total: {objective_counts['herald']})")
+                            
+                            elif event_type == "BUILDING_KILL" and my_team_id:
+                                killer_pid = event.get("killerId")
+                                killer_puuid = pid_to_puuid.get(killer_pid)
+                                if killer_puuid:
+                                    killer_team = next((p.get("teamId") for p in participants if p.get("puuid") == killer_puuid), None)
+                                    if killer_team == my_team_id:
+                                        building_type = event.get("buildingType", "").lower()
+                                        if "tower" in building_type:
+                                            objective_counts["tower"] += 1
+                                            print(f"[EVENT] Tower +1 (total: {objective_counts['tower']})")
+                                        elif "inhibitor" in building_type:
+                                            objective_counts["inhibitor"] += 1
+                                            print(f"[EVENT] Inhibitor +1 (total: {objective_counts['inhibitor']})")
+
+                    print(f"[TIMELINE] Event processing complete. Kills: {len(kill_positions)}, Objectives: {objective_counts}")
+
+                    # Calculate insights
+                    if not gold_diffs:
+                        print(f"[TIMELINE] ERROR: No gold diffs calculated for {match_id}, cannot compute insights")
+                        return None
+                    
+                    print(f"[TIMELINE] Computing insights for {match_id}")
+                    
+                    # Early dominance (0-10 min)
+                    early_diffs = [diff for ts, diff in gold_diffs if ts <= 600000]
+                    early_dominance = sum(early_diffs) / len(early_diffs) if early_diffs else 0
+                    print(f"[INSIGHT] early_dominance={early_dominance:.2f} (computed from {len(early_diffs)} samples)")
+                    
+                    # Midgame swing (10-20 min)
+                    mid_diffs = [diff for ts, diff in gold_diffs if 600000 < ts <= 1200000]
+                    midgame_swing = max(mid_diffs) - min(mid_diffs) if len(mid_diffs) > 1 else 0
+                    print(f"[INSIGHT] midgame_swing={midgame_swing:.2f} (computed from {len(mid_diffs)} samples)")
+                    
+                    # Consistency score (variance)
+                    all_diffs = [diff for ts, diff in gold_diffs]
+                    mean_diff = sum(all_diffs) / len(all_diffs) if all_diffs else 0
+                    variance = sum((x - mean_diff) ** 2 for x in all_diffs) / len(all_diffs) if all_diffs else 0
+                    consistency = 100 - min(variance / 100, 100)
+                    print(f"[INSIGHT] consistency={consistency:.2f} (variance={variance:.2f}, mean={mean_diff:.2f})")
+                    
+                    # Biggest spike/throw
+                    deltas = [all_diffs[i] - all_diffs[i-1] for i in range(1, len(all_diffs))]
+                    biggest_spike = max(deltas) if deltas else 0
+                    biggest_throw = min(deltas) if deltas else 0
+                    print(f"[INSIGHT] spike={biggest_spike:.2f} throw={biggest_throw:.2f}")
+                    
+                    # Roam score (position changes)
+                    roam_score = 0
+                    if len(positions) > 1:
+                        significant_moves = 0
+                        for i in range(1, len(positions)):
+                            x1, y1 = positions[i-1]
+                            x2, y2 = positions[i]
+                            dist = ((x2-x1)**2 + (y2-y1)**2) ** 0.5
+                            if dist > 3000:  # Significant movement
+                                significant_moves += 1
+                        roam_score = significant_moves / (len(positions) / 10)  # Normalize per 10 frames
+                        print(f"[INSIGHT] roam_score={roam_score:.2f} (from {significant_moves} significant moves in {len(positions)} positions)")
+                    else:
+                        print(f"[INSIGHT] roam_score=0 (insufficient position data)")
+                    
+                    # Comeback type
+                    comeback_type = "neutral"
+                    if early_dominance > 100 and all_diffs[-1] > 500:
+                        comeback_type = "dominated"
+                    elif early_dominance < -100 and all_diffs[-1] > 500:
+                        comeback_type = "comeback"
+                    elif early_dominance > 100 and all_diffs[-1] < -500:
+                        comeback_type = "throw"
+                    elif early_dominance < -100 and all_diffs[-1] < -500:
+                        comeback_type = "fell_behind"
+                    print(f"[INSIGHT] comeback_type={comeback_type}")
+                    
+                    result = {
+                        "match_id": match_id,
+                        "puuid": puuid,
+                        "early_dominance_score": round(early_dominance, 2),
+                        "midgame_swing_score": round(midgame_swing, 2),
+                        "consistency_score": round(consistency, 2),
+                        "level_6_timestamp": level_6_time,
+                        "level_11_timestamp": level_11_time,
+                        "level_16_timestamp": level_16_time,
+                        "biggest_spike": round(biggest_spike, 2),
+                        "biggest_throw": round(biggest_throw, 2),
+                        "roam_score": round(roam_score, 2),
+                        "kill_positions": kill_positions,
+                        "objective_presence": objective_counts,
+                        "comeback_type": comeback_type,
+                        "duration": match_duration
+                    }
+                    print(f"[TIMELINE] Successfully processed match {match_id}")
+                    return result
+                except Exception as e:
+                    print(f"[TIMELINE] ERROR: Exception processing match {match_id}: {e}")
+                    traceback.print_exc()
+                    return None
 
             # Process matches with rate limiting
             print(f"[TIMELINE] Starting batch processing with semaphore(10)")
@@ -1360,16 +1370,15 @@ async def get_timeline_stats():
         return jsonify({"error": "Missing required parameters: gameName and tagLine."}), 400
 
     try:
-        async with aiohttp.ClientSession() as session:
+        async with riot.new_session() as session:
             # Step 1: Get PUUID
-            account_url = f"https://americas.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}"
-            async with session.get(account_url, headers={"X-Riot-Token": RIOT_API_KEY}) as account_response:
-                if account_response.status != 200:
-                    return jsonify({"error": "Failed to fetch account"}), account_response.status
-                account_data = await account_response.json()
-                puuid = account_data.get("puuid")
-                if not puuid:
-                    return jsonify({"error": "PUUID not found"}), 500
+            account = await riot.fetch_account(session, game_name, tag_line)
+            if not account.ok:
+                body, http_status = account_failure(account.status)
+                return jsonify(body), http_status
+            puuid = (account.data or {}).get("puuid")
+            if not puuid:
+                return jsonify({"error": "PUUID not found"}), 500
 
         # Step 2: Load all timeline summaries for this PUUID
         rows = MatchTimelineSummary.query.filter_by(puuid=puuid).all()
@@ -1523,20 +1532,19 @@ async def generate_recap():
     print(f"[RECAP] Generating recap for {game_name}#{tag_line}")
     
     try:
-        async with aiohttp.ClientSession() as session:
+        async with riot.new_session() as session:
             # Step 1: Get PUUID
             print("[RECAP] Fetching account data...")
-            account_url = f"https://americas.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}"
-            async with session.get(account_url, headers={"X-Riot-Token": RIOT_API_KEY}) as account_response:
-                if account_response.status != 200:
-                    print(f"[RECAP] ERROR: Failed to fetch account: {account_response.status}")
-                    return jsonify({"error": "Failed to fetch account"}), account_response.status
-                account_data = await account_response.json()
-                puuid = account_data.get("puuid")
-                if not puuid:
-                    print("[RECAP] ERROR: PUUID not found")
-                    return jsonify({"error": "PUUID not found"}), 500
-                print(f"[RECAP] PUUID resolved: {puuid}")
+            account = await riot.fetch_account(session, game_name, tag_line)
+            if not account.ok:
+                print(f"[RECAP] ERROR: account lookup failed: {account.status}")
+                body, http_status = account_failure(account.status)
+                return jsonify(body), http_status
+            puuid = (account.data or {}).get("puuid")
+            if not puuid:
+                print("[RECAP] ERROR: PUUID not found")
+                return jsonify({"error": "PUUID not found"}), 500
+            print(f"[RECAP] PUUID resolved: {puuid}")
         
         # Step 2: Fetch stats data from database
         print("[RECAP] Querying database for stats...")
@@ -1762,5 +1770,5 @@ TIMELINE_DATA (already cleaned):
 
 # Run the app
 if __name__ == "__main__":
-    print("Starting Rift Rewind Backend. Make sure your RIOT_API_KEY is set in a .env file.")
+    print("Starting Rift Rewind Backend. Check /health to verify configuration.")
     app.run(debug=True)

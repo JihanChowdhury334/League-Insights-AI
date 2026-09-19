@@ -45,10 +45,11 @@ export default function Home() {
 
     try {
       // Call API pipeline in order: 1→2→3
+      // No region argument: the backend detects the player's routing cluster.
       const result = await fetchAllData(
         gameName,
         tagLine,
-        "americas",
+        undefined,
         (step) => {
           setProgress(step);
           toast.info(step);

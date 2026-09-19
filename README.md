@@ -15,27 +15,38 @@ Searching any other Riot IDs will trigger **full year-long match-history aggrega
 
 ## 🌍 Region Support
 
-League Insights AI **supports all Riot regions**, including:
+League Insights AI supports every active Riot region. Match-V5 is served from
+four *regional routing clusters*, and each platform maps to exactly one:
 
-- **NA**
-- **EUW**
-- **EUNE**
-- **KR**
-- **BR**
-- **LAN**
-- **LAS**
-- **OCE**
-- **JP**
-- **TR**
-- **RU**
-- **PH2**
-- **SG2**
-- **TH2**
-- **TW2**
-- **VN2**
-- **and all other active Riot routing regions**
+| Cluster | Platforms |
+|---|---|
+| `americas` | NA1, BR1, LA1 (LAN), LA2 (LAS) |
+| `europe` | EUW1, EUN1 (EUNE), TR1, RU, ME1 |
+| `asia` | KR, JP1 |
+| `sea` | OC1 (OCE), PH2, SG2, TH2, TW2, VN2 |
 
-Region is automatically detected based on your Riot ID (`gameName#tagLine`), so **no manual input is required**.
+Region is detected automatically — no manual input required.
+
+### How detection works
+
+Querying the wrong cluster does not return an error: it returns an **empty
+match list**, which is indistinguishable from "this player has no games." So
+detection falls through four strategies, most authoritative first:
+
+1. **Explicit `region` parameter**, if the caller supplies one.
+2. **Riot's Account-V1 region endpoint** — authoritative, but not granted to
+   every API key (personal keys commonly answer `403`).
+3. **The tagLine**, when it happens to name a region (`#EUW`, `#KR`).
+   A tagLine is free text, so this is a hint only — `#Jihan` is just as valid.
+4. **A cluster probe** — ask all four clusters for a single match ID and keep
+   whichever one actually has data. Costs at most four requests, cached per
+   player thereafter.
+
+Step 4 is what makes the app correct for a player on `#SomeVanityTag` whose key
+lacks the region endpoint. Both earlier strategies fail silently in that case.
+
+The logic lives in [`backend/riot.py`](backend/riot.py) and is covered by
+[`backend/tests/test_riot.py`](backend/tests/test_riot.py).
 
 League Insights AI is a full-stack web application that analyzes your League of Legends match history, providing deep insights into your gameplay patterns, strengths, weaknesses, and playstyle using advanced timeline analysis and AI-generated narratives powered by AWS Bedrock (Claude).
 
@@ -157,28 +168,57 @@ Explore League Insights AI in action — from data-driven stats to AI-powered re
    ```
 
 4. **Set up environment variables**
-   
-   Create a `.env` file in the `backend` directory:
+
+   ```bash
+   cp .env.example .env
+   ```
+
+   Then fill in `.env` (it is gitignored — never commit it):
    ```env
-   RIOT_API_KEY=your_riot_api_key_here
+   RIOT_API_KEY=RGAPI-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
    DATABASE_URL=postgresql://user:password@localhost:5432/league_insights
    AWS_ACCESS_KEY_ID=your_aws_access_key
    AWS_SECRET_ACCESS_KEY=your_aws_secret_key
    AWS_REGION=us-east-1
-   PORT=5000
    ```
 
-5. **Initialize the database**
+   Get a key at [developer.riotgames.com](https://developer.riotgames.com/).
+   A **development** key expires every 24 hours; a **personal** key does not
+   expire but is granted a narrower set of endpoints. The app handles both — see
+   [How detection works](#how-detection-works).
+
+5. **Verify the key and region detection**
+   ```bash
+   python scripts/check_riot_key.py                 # key reachability only
+   python scripts/check_riot_key.py Faker KR1       # + full region resolution
+   ```
+
+   This reports whether the key is live, which endpoints it is actually granted,
+   which cluster holds a given player's matches, and which cluster the app
+   resolves to. Run it first whenever the app returns no matches — it separates
+   a key problem from a routing problem in one command.
+
+6. **Initialize the database**
    ```bash
    flask db upgrade
    ```
 
-6. **Run the backend server**
+7. **Run the backend server**
    ```bash
    python app.py
    ```
-   
-   Backend will be available at `http://localhost:5000`
+
+   Backend will be available at `http://localhost:5000`.
+   `GET /health` reports the status of the API key, database, and Bedrock
+   client without echoing any secrets.
+
+8. **Run the tests**
+   ```bash
+   pip install -r requirements-dev.txt
+   python -m pytest
+   ```
+
+   The suite is offline — no API key or network required.
 
 ### **Frontend Setup**
 
@@ -246,12 +286,32 @@ echo "gunicorn==21.2.0" >> backend/requirements.txt
 
 ### **Core Endpoints**
 
+#### `GET /health`
+Reports whether the API key, database, and Bedrock client are configured.
+Returns `200` when healthy and `503` when degraded. Secrets are never echoed —
+the key appears only as a truncated fingerprint.
+
+```json
+{
+  "status": "healthy",
+  "checks": {
+    "riot_api_key": "ok",
+    "riot_api_key_fingerprint": "RGAPI-1234...cdef",
+    "database": "ok",
+    "bedrock": "ok"
+  }
+}
+```
+
 #### `GET /get-stats`
 Fetches match history and computes comprehensive statistics.
 
 **Query Parameters:**
-- `gameName` (string): Riot ID game name
-- `tagLine` (string): Riot ID tag line
+- `gameName` (string, required): Riot ID game name
+- `tagLine` (string, required): Riot ID tag line
+- `region` (string, optional): Platform or cluster (`euw1`, `kr`, `europe`, …).
+  Omit it to let the backend detect the routing cluster automatically; supplying
+  it overrides detection.
 
 **Response:**
 ```json
@@ -419,9 +479,16 @@ Comeback Wins: 1 | Throws: 12
 ```
 League-Insights-AI/
 ├── backend/
-│   ├── app.py                  # Main Flask application
+│   ├── app.py                  # Flask application and endpoints
+│   ├── riot.py                 # Riot API layer: auth, routing, retries
 │   ├── requirements.txt        # Python dependencies
-│   ├── .env                    # Environment variables (not in repo)
+│   ├── requirements-dev.txt    # Test dependencies
+│   ├── .env.example            # Template for local configuration
+│   ├── .env                    # Real secrets (gitignored, not in repo)
+│   ├── scripts/
+│   │   └── check_riot_key.py   # Key + region diagnostic CLI
+│   ├── tests/
+│   │   └── test_riot.py        # Offline tests for routing resolution
 │   └── migrations/             # Database migrations
 │       ├── alembic.ini
 │       ├── env.py

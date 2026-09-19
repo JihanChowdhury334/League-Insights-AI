@@ -47,7 +47,7 @@ export default function RecapPage() {
     setIsLoading(true);
     try {
       toast.info("Generating your AI recap...");
-      const data = await generateRecap(playerInfo.gameName, playerInfo.tagLine, "americas");
+      const data = await generateRecap(playerInfo.gameName, playerInfo.tagLine);
       setRecap(data);
       toast.success("Recap generated! 🎉");
     } catch (error) {
