@@ -265,3 +265,49 @@ async def test_server_error_is_retried_then_surfaced():
     )
     assert response.status == 503
     assert len(session.calls) == 3, "should be 1 initial attempt + 2 retries"
+
+
+# --------------------------------------------------------------------------
+# Routing-value sets are not interchangeable
+# --------------------------------------------------------------------------
+
+def test_sea_is_valid_for_match_v5():
+    """OCE/SEA servers are served by the 'sea' Match-V5 cluster."""
+    assert "sea" in riot.CLUSTERS
+
+
+def test_sea_is_not_valid_for_account_v1():
+    """Account-V1's routing values are americas/europe/asia (+esports).
+
+    'sea' is Match-V5 only. Querying account-v1 there fails in a way that
+    looks like a rejected key, so the two sets must stay distinct.
+    """
+    assert "sea" not in riot.ACCOUNT_CLUSTERS
+    assert set(riot.ACCOUNT_CLUSTERS) < set(riot.CLUSTERS)
+
+
+def test_account_cluster_default_is_valid_for_account_v1():
+    assert riot.ACCOUNT_CLUSTER in riot.ACCOUNT_CLUSTERS
+
+
+@pytest.mark.asyncio
+async def test_account_lookup_uses_a_single_global_host():
+    """Account data is global -- one host resolves any region's Riot ID.
+
+    Guards against reintroducing a per-region account lookup, which is both
+    unnecessary and wrong for 'sea'.
+    """
+    session = FakeSession({"/accounts/by-riot-id/": (200, {"puuid": PUUID})})
+    res = await riot.fetch_account(session, "Player", "OC1")
+    assert res.ok
+    assert len(session.calls) == 1
+    assert f"{riot.ACCOUNT_CLUSTER}.api.riotgames.com" in session.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_riot_id_is_url_encoded():
+    """Riot IDs allow spaces and unicode; they must not break the URL."""
+    session = FakeSession({"/accounts/by-riot-id/": (200, {"puuid": PUUID})})
+    await riot.fetch_account(session, "Hide on bush", "KR1")
+    assert " " not in session.calls[0]
+    assert "Hide%20on%20bush" in session.calls[0]

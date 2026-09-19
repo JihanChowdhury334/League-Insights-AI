@@ -58,14 +58,16 @@ async def main() -> int:
     tag_line = sys.argv[2] if len(sys.argv) > 2 else None
 
     async with riot.new_session() as session:
-        # ---- 1. Account-V1 reachability across every cluster -------------
-        # Account-V1 is a global service, so a healthy key answers on all four.
-        # Differences here point at a network/proxy issue, not a key issue.
+        # ---- 1. Account-V1 reachability ---------------------------------
+        # Account-V1 is global: any supported routing value resolves any Riot
+        # ID, so a healthy key answers on all of them. Note this iterates
+        # ACCOUNT_CLUSTERS, not CLUSTERS -- 'sea' is valid for Match-V5 only,
+        # and probing account-v1 there reports a failure that is not real.
         probe_name, probe_tag = (game_name, tag_line) if game_name else ("Faker", "KR1")
         print(f"\n{DIM}Account-V1 by-riot-id, probing {probe_name}#{probe_tag}{RESET}")
 
         reachable = []
-        for cluster in riot.CLUSTERS:
+        for cluster in riot.ACCOUNT_CLUSTERS:
             url = (
                 f"https://{cluster}.api.riotgames.com"
                 f"/riot/account/v1/accounts/by-riot-id/{probe_name}/{probe_tag}"

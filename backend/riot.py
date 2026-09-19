@@ -38,11 +38,26 @@ load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 
 RIOT_API_KEY = os.getenv("RIOT_API_KEY", "").strip()
 
-# Account-V1 is a global service: any cluster can resolve any Riot ID. We pin
-# one for predictable latency and allow it to be overridden per deployment.
-ACCOUNT_CLUSTER = os.getenv("RIOT_ACCOUNT_CLUSTER", "americas")
+# Account-V1 is a global service: any supported cluster can resolve any Riot
+# ID. We pin one for predictable latency and allow a per-deployment override.
+# Validated below, because 'sea' is a plausible-looking but invalid choice.
+ACCOUNT_CLUSTER = os.getenv("RIOT_ACCOUNT_CLUSTER", "americas").strip().lower()
 
+# Match-V5 routing values. All four are valid for match endpoints.
 CLUSTERS = ("americas", "europe", "asia", "sea")
+
+# Account-V1 routing values are NOT the same set: 'sea' is Match-V5 only.
+# Account data is global, so any one of these resolves any Riot ID -- but
+# querying account-v1 on 'sea' is unsupported and fails misleadingly.
+ACCOUNT_CLUSTERS = ("americas", "europe", "asia")
+
+if ACCOUNT_CLUSTER not in ACCOUNT_CLUSTERS:
+    print(
+        f"[config] RIOT_ACCOUNT_CLUSTER='{ACCOUNT_CLUSTER}' is not valid for "
+        f"Account-V1 (choose from {', '.join(ACCOUNT_CLUSTERS)}); "
+        f"falling back to 'americas'."
+    )
+    ACCOUNT_CLUSTER = "americas"
 
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 
