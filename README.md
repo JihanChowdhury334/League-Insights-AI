@@ -34,16 +34,23 @@ match list**, which is indistinguishable from "this player has no games." So
 detection falls through four strategies, most authoritative first:
 
 1. **Explicit `region` parameter**, if the caller supplies one.
-2. **Riot's Account-V1 region endpoint** — authoritative, but not granted to
-   every API key (personal keys commonly answer `403`).
-3. **The tagLine**, when it happens to name a region (`#EUW`, `#KR`).
+2. **The tagLine**, when it happens to name a region (`#EUW`, `#KR`).
    A tagLine is free text, so this is a hint only — `#Jihan` is just as valid.
-4. **A cluster probe** — ask all four clusters for a single match ID and keep
+3. **A cluster probe** — ask all four clusters for a single match ID and keep
    whichever one actually has data. Costs at most four requests, cached per
    player thereafter.
 
-Step 4 is what makes the app correct for a player on `#SomeVanityTag` whose key
-lacks the region endpoint. Both earlier strategies fail silently in that case.
+Both steps use **only Match-V5**, so detection never depends on an endpoint
+outside the set every LoL key already needs. Step 3 is what makes the app
+correct for a player on `#SomeVanityTag`, where the tagLine tells us nothing.
+
+Account-V1's `region/by-game` endpoint would answer this in one request, but it
+is **not used by default** — set `RIOT_USE_REGION_ENDPOINT=true` to enable it as
+the first strategy and skip the probe.
+
+> **Routing values differ per API.** Match-V5 serves `americas`/`europe`/`asia`/`sea`;
+> Account-V1 serves `americas`/`europe`/`asia` — there is no `sea` for account
+> lookups. Account data is global, so one host resolves any Riot ID.
 
 The logic lives in [`backend/riot.py`](backend/riot.py) and is covered by
 [`backend/tests/test_riot.py`](backend/tests/test_riot.py).

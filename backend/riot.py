@@ -59,6 +59,16 @@ if ACCOUNT_CLUSTER not in ACCOUNT_CLUSTERS:
     )
     ACCOUNT_CLUSTER = "americas"
 
+# Whether to consult Account-V1's region endpoint during cluster resolution.
+# Off by default: it is not part of the endpoint set every key is expected to
+# carry, and resolution does not need it -- the tagLine hint and the Match-V5
+# probe below determine the cluster from data the app already has access to.
+# Set RIOT_USE_REGION_ENDPOINT=true to enable it as the first strategy, which
+# saves the probe's requests when the key does grant it.
+USE_REGION_ENDPOINT = os.getenv("RIOT_USE_REGION_ENDPOINT", "false").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10)
 
 
@@ -359,9 +369,13 @@ async def resolve_cluster(
 
     1. An explicit ``region`` from the caller, when it names a real region.
     2. The cached answer for this PUUID.
-    3. Riot's own Account-V1 region endpoint (authoritative, key permitting).
+    3. Riot's Account-V1 region endpoint -- only if ``USE_REGION_ENDPOINT``
+       is enabled, since it is not relied upon by default.
     4. The tagLine, when it happens to look like a region.
-    5. A probe across all four clusters.
+    5. A probe across all four Match-V5 clusters.
+
+    Steps 4 and 5 use only Match-V5, which every LoL key needs anyway, so
+    resolution never depends on an endpoint outside the app's core set.
 
     Falls back to ``americas`` only when every strategy is exhausted, and says
     so in the logs rather than defaulting silently.
@@ -375,12 +389,13 @@ async def resolve_cluster(
     if cached:
         return cached
 
-    platform = await fetch_active_platform(session, puuid)
-    resolved = cluster_for_platform(platform)
-    if resolved:
-        print(f"[region] Riot reports platform '{platform}' -> cluster '{resolved}'")
-        remember_cluster(puuid, resolved)
-        return resolved
+    if USE_REGION_ENDPOINT:
+        platform = await fetch_active_platform(session, puuid)
+        resolved = cluster_for_platform(platform)
+        if resolved:
+            print(f"[region] Riot reports platform '{platform}' -> cluster '{resolved}'")
+            remember_cluster(puuid, resolved)
+            return resolved
 
     hinted = cluster_for_platform(tag_line)
     if hinted:

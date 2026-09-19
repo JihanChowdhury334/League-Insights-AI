@@ -101,12 +101,16 @@ async def main() -> int:
         print(f"  {OK}  PUUID {puuid[:12]}...")
 
         # ---- 3. Is the region endpoint granted to this key? -------------
-        print(f"\n{DIM}Account-V1 region endpoint (authoritative when granted){RESET}")
+        # Informational only. The app does not use this by default
+        # (RIOT_USE_REGION_ENDPOINT), so a failure here is not a problem --
+        # it just means the probe below does the work instead.
+        print(f"\n{DIM}Account-V1 region endpoint (informational; unused by default){RESET}")
         platform = await riot.fetch_active_platform(session, puuid)
         if platform:
-            print(f"  {OK}  Riot reports platform: {platform}")
+            print(f"  {OK}  Granted. Riot reports platform: {platform}")
+            print(f"  {DIM}      Set RIOT_USE_REGION_ENDPOINT=true to skip the probe.{RESET}")
         else:
-            print(f"  {WARN}  Unavailable to this key -- the probe below covers it.")
+            print(f"  {DIM}  ....{RESET}  Not available to this key -- expected, and fine.")
 
         # ---- 4. Which cluster actually has the matches? ------------------
         print(f"\n{DIM}Match-V5 per cluster (the ground truth){RESET}")

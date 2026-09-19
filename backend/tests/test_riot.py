@@ -178,9 +178,31 @@ async def test_explicit_region_wins_and_costs_no_requests():
     assert session.calls == []
 
 
+@pytest.fixture
+def region_endpoint_enabled(monkeypatch):
+    monkeypatch.setattr(riot, "USE_REGION_ENDPOINT", True)
+
+
+def test_region_endpoint_is_disabled_by_default():
+    """Resolution must not depend on an endpoint outside the core key set."""
+    assert riot.USE_REGION_ENDPOINT is False
+
+
 @pytest.mark.asyncio
-async def test_riot_region_endpoint_is_preferred_over_tagline():
-    """A vanity tagLine must not override what Riot itself reports."""
+async def test_region_endpoint_is_not_called_when_disabled():
+    """The default path uses only Match-V5, which every LoL key carries."""
+    session = FakeSession({
+        "/region/by-game/lol": (200, {"region": "KR"}),
+        "europe.api.riotgames.com/lol/match/v5": (200, ["EUW1_1"]),
+    })
+    cluster = await riot.resolve_cluster(session, PUUID, tag_line="mystery")
+    assert cluster == "europe", "should probe, not consult the region endpoint"
+    assert not any("/region/by-game/" in c for c in session.calls)
+
+
+@pytest.mark.asyncio
+async def test_riot_region_endpoint_is_preferred_over_tagline(region_endpoint_enabled):
+    """When explicitly enabled, a vanity tagLine must not override Riot."""
     session = FakeSession({
         "/region/by-game/lol": (200, {"region": "KR"}),
     })
@@ -189,8 +211,8 @@ async def test_riot_region_endpoint_is_preferred_over_tagline():
 
 
 @pytest.mark.asyncio
-async def test_tagline_used_when_region_endpoint_is_forbidden():
-    """403 on the region endpoint is normal for personal keys, not fatal."""
+async def test_tagline_used_when_region_endpoint_is_forbidden(region_endpoint_enabled):
+    """403 on the region endpoint must degrade, not fail."""
     session = FakeSession({
         "/region/by-game/lol": (403, None),
     })
@@ -206,7 +228,6 @@ async def test_probe_finds_the_cluster_when_tagline_is_a_vanity_tag():
     code defaulted to americas and returned an empty match list.
     """
     session = FakeSession({
-        "/region/by-game/lol": (403, None),
         "europe.api.riotgames.com/lol/match/v5": (200, ["EUW1_123"]),
         "americas.api.riotgames.com/lol/match/v5": (200, []),
     })
